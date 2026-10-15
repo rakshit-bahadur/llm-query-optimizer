@@ -5,8 +5,11 @@ from unittest.mock import MagicMock
 import pandas as pd
 import pytest
 
-from query_optimizer.costs import add_costs, detect_platform, load_history, summarise_by_fingerprint
-from query_optimizer.llm import build_messages, parse_response, suggest_rewrite
+from query_optimizer.costs import (
+    add_costs, add_fingerprints, detect_platform, load_history, set_warehouse_sizes, summarise_by_fingerprint,
+    unpriced_sizes, warehouses_without_size,
+)
+from query_optimizer.llm import build_messages, check_rewrite, parse_response, suggest_rewrite
 from query_optimizer.rules import ParseError, analyze, fingerprint, score
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -125,6 +128,60 @@ def test_databricks_export_is_detected_and_priced():
     assert df.loc[0, "pruning_ratio"] == pytest.approx(0.1)
 
 
+def test_unknown_warehouse_size_is_flagged_not_hidden():
+    raw = snowflake_rows()
+    raw.loc[2, "WAREHOUSE_SIZE"] = "Gigantic"
+    df = add_costs(load_history(raw))
+    assert not df.loc[2, "cost_known"]
+    assert df.loc[2, "est_cost_usd"] == 0
+    assert df.loc[0, "cost_known"]
+    assert unpriced_sizes(df) == {"GIGANTIC": 1}
+    summary = summarise_by_fingerprint(df)
+    assert summary["unpriced_runs"].sum() == 1
+
+
+def test_warehouse_size_spellings_are_unified():
+    raw = snowflake_rows()
+    raw["WAREHOUSE_SIZE"] = ["XXLarge", "2X-Large", "x_small"]
+    df = add_costs(load_history(raw))
+    assert list(df["warehouse_size"]) == ["2X-LARGE", "2X-LARGE", "X-SMALL"]
+    assert df["cost_known"].all()
+
+
+def databricks_rows(**extra):
+    return pd.DataFrame({
+        "statement_id": ["s1", "s2", "s3"],
+        "statement_text": ["select id from events where d = '2026-01-01'"] * 3,
+        "total_duration_ms": [3_600_000] * 3,
+        "warehouse_id": ["wh-a", "wh-a", "wh-b"],
+        **extra,
+    })
+
+
+def test_databricks_without_size_asks_instead_of_guessing():
+    df = load_history(databricks_rows())
+    assert df["warehouse_size"].isna().all()
+    assert warehouses_without_size(df) == ["wh-a", "wh-b"]
+    assert unpriced_sizes(add_costs(df)) == {"missing": 3}
+
+    sized = add_costs(set_warehouse_sizes(df, {"wh-a": "Medium"}), usd_per_dbu=1.0)
+    assert list(sized["compute_units"]) == pytest.approx([24.0, 24.0, 0.0])
+    assert unpriced_sizes(sized) == {"missing": 1}
+
+
+def test_set_warehouse_sizes_only_fills_blanks():
+    df = load_history(databricks_rows(warehouse_size=["Large", None, "2X_Small"]))
+    filled = set_warehouse_sizes(df, {"wh-a": "Small", "wh-b": "Small"})
+    assert list(filled["warehouse_size"]) == ["LARGE", "SMALL", "2X-SMALL"]
+
+
+def test_precomputed_fingerprints_give_the_same_summary():
+    df = add_costs(load_history(snowflake_rows()))
+    direct = summarise_by_fingerprint(df)
+    cached = summarise_by_fingerprint(add_fingerprints(df))
+    pd.testing.assert_frame_equal(direct, cached)
+
+
 def test_unknown_export_is_rejected():
     with pytest.raises(ValueError, match="Unrecognised"):
         load_history(pd.DataFrame({"a": [1]}))
@@ -171,3 +228,30 @@ def test_suggest_rewrite_calls_groq_and_requires_key(monkeypatch):
     _, kwargs = session.post.call_args
     assert kwargs["headers"]["Authorization"] == "Bearer k"
     assert kwargs["json"]["response_format"] == {"type": "json_object"}
+
+
+# Rewrite check
+
+def test_check_rewrite_reports_fixed_issues_and_score():
+    check = check_rewrite("select * from t where to_date(ts) = '2026-01-01'",
+                          "select id from t where ts >= '2026-01-01' and ts < '2026-01-02'", "snowflake")
+    assert check.parses
+    assert check.score_after == 100 and check.score_before < 100
+    assert len(check.fixed) == 2
+    assert check.remaining == [] and check.new == []
+
+
+def test_check_rewrite_flags_sql_that_does_not_parse():
+    check = check_rewrite("select id from t limit 5", "selec id frm t", "databricks")
+    assert not check.parses
+    assert "databricks" in check.error
+    assert not check_rewrite("select id from t limit 5", "  ", "snowflake").parses
+
+
+def test_check_rewrite_flags_new_issues_and_changed_columns():
+    check = check_rewrite("select a, b from t where d > '2026-01-01' limit 5",
+                          "select a from t where d > '2026-01-01' order by a", "snowflake")
+    assert check.new == ["ORDER BY on the full result without LIMIT"]
+    assert check.same_columns is False
+    same = check_rewrite("select a as x from t limit 5", "select b as x from t limit 5", "snowflake")
+    assert same.same_columns is True
